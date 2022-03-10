@@ -48,6 +48,32 @@ def data_loading(data_dir):
             data_sentence,labels_sentence = [],[]
     return data_article , labels_article
 
+def tokenize():
+    input_ids_art = []
+    attention_masks_art = []
+    labels = []
+    for art in range(len(article)):
+        input_ids_sent = []
+        attention_masks_sent = []
+        for sent in article[art]:
+            encoded_dict = tokenizer.encode_plus(
+                                sent,                      # Sentence to encode.
+                                add_special_tokens = True, # Add '[CLS]' and '[SEP]'
+                                max_length = 32,           # Pad & truncate all sentences.
+                                pad_to_max_length = True,
+                                return_attention_mask = True,   # Construct attn. masks.
+                                return_tensors = 'pt',     # Return pytorch tensors.
+                        )
+            input_ids_sent.append(encoded_dict['input_ids'])
+            attention_masks_sent.append(encoded_dict['attention_mask'])
+        input_ids_sent = torch.cat(input_ids_sent, dim=0)
+        attention_masks_sent = torch.cat(attention_masks_sent, dim=0)
+        labels_sent = torch.tensor(labels_[art])
+        input_ids_art.append(input_ids_sent)
+        attention_masks_art.append(attention_masks_sent)
+        labels.append(labels_sent)
+    return input_ids_art,attention_masks_art,labels
+
 def padding(id,mask,label,max_sent_num=50,max_sent_len=32):     
     valid_num = []
     for i in range(len(id)):
@@ -168,49 +194,30 @@ def evaluate(model):
     return avg_acc
 
 
+def main():
+    train_data = data_loading('./train.csv')
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+    article,labels_ = train_data[0],train_data[1]
+    input_ids_art,attention_masks_art,labels = tokenize()
+    input_ids_art,attention_masks_art,labels,valid_num = padding(input_ids_art,attention_masks_art,labels)
+    input_ids_art.size(),attention_masks_art.size(),labels.size(),len(valid_num)
+    dataset = article_dataset(input_ids_art,attention_masks_art,labels,valid_num)
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_sampler = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset,sampler=train_sampler,batch_size=2,drop_last=True)
+    val_sampler = SequentialSampler(val_dataset)
+    val_dataloader = DataLoader(val_dataset,sampler=val_sampler,batch_size=2,drop_last=True)
+    model = HAN('bert-base-uncased',256,1,8,0.1)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    optimizer = AdamW(model.parameters(), lr = 2e-5, eps = 1e-8)
+    epochs = 2
+    total_steps = len(train_dataloader) * epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = total_steps)
+    train(model,optimizer)
+    test_acc = evaluate(model)
 
-train_data = data_loading('./train.csv')
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
-article,labels_ = train_data[0],train_data[1]
-input_ids_art = []
-attention_masks_art = []
-labels = []
-# For every sentence...
-for art in range(len(article)):
-    input_ids_sent = []
-    attention_masks_sent = []
-    for sent in article[art]:
-        encoded_dict = tokenizer.encode_plus(
-                            sent,                     
-                            add_special_tokens = True,
-                            max_length = 32,
-                            pad_to_max_length = True,
-                            return_attention_mask = True,
-                            return_tensors = 'pt',)
-        input_ids_sent.append(encoded_dict['input_ids'])
-        attention_masks_sent.append(encoded_dict['attention_mask'])
-    input_ids_sent = torch.cat(input_ids_sent, dim=0)
-    attention_masks_sent = torch.cat(attention_masks_sent, dim=0)
-    labels_sent = torch.tensor(labels_[art])
-    input_ids_art.append(input_ids_sent)
-    attention_masks_art.append(attention_masks_sent)
-    labels.append(labels_sent)
-input_ids_art,attention_masks_art,labels,valid_num = padding(input_ids_art,attention_masks_art,labels)
-input_ids_art.size(),attention_masks_art.size(),labels.size(),len(valid_num)
-dataset = article_dataset(input_ids_art,attention_masks_art,labels,valid_num)
-train_size = int(0.9 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-train_sampler = RandomSampler(train_dataset)
-train_dataloader = DataLoader(train_dataset,sampler=train_sampler,batch_size=2,drop_last=True)
-val_sampler = SequentialSampler(val_dataset)
-val_dataloader = DataLoader(val_dataset,sampler=val_sampler,batch_size=2,drop_last=True)
-model = HAN('bert-base-uncased',256,1,8,0.1)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-optimizer = AdamW(model.parameters(), lr = 2e-5, eps = 1e-8)
-epochs = 2
-total_steps = len(train_dataloader) * epochs
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = total_steps)
-train(model,optimizer)
-test_acc = evaluate(model)
+if __name__ == '__main__':
+    main()
