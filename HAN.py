@@ -102,23 +102,56 @@ class article_dataset(Dataset):
         return self.input[idx],self.masks[idx],self.labels[idx],self.valid_num[idx]      #input和masks维度为sentence_num,sentence_len，label维度 sentence_num
     def __len__(self):                                                                 #valid_num为int
         return len(self.input)
-    
+
+class linear_resnetblock(nn.Module):
+    def __init__(self,input_size,output_size,drop=0.1):
+        super(linear_resnetblock,self).__init__()
+        self.res = nn.Sequential(
+            nn.Linear(input_size,output_size),
+            nn.Dropout(drop),
+            nn.ReLU(),
+            nn.LayerNorm(output_size)
+        )
+        self.relu = nn.ReLU()
+    def forward(self,x):
+        out = self.res(x)
+        return self.relu(out+x)  
+
 class HAN(nn.Module):
     def __init__(self,bert_name,hidden_size_rnn,num_layers_rnn,classes,dropout):     #valid_num表示该input中有效的sentence个数
         super(HAN,self).__init__()
         self.bert = BertModel.from_pretrained(bert_name)
         hidden_size_bert = self.bert.config.hidden_size
         self.rnn = nn.LSTM(input_size=hidden_size_bert, hidden_size=hidden_size_rnn, num_layers=num_layers_rnn, bias=True, dropout=dropout,batch_first=True)
-        self.outlayer = nn.Linear(hidden_size_rnn,classes)
+        #self.outlayer = nn.Linear(hidden_size_rnn,classes)
         self.loss = nn.CrossEntropyLoss()
-        self.classes = classes        
+        self.classes = classes
+        self.outlayer = nn.Sequential(nn.Linear(hidden_size_rnn,512),
+                                        nn.Dropout(0.5),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        linear_resnetblock(512,512),
+                                        nn.ELU(),
+                                        nn.Dropout(0.5),
+                                        nn.Linear(512,256),
+                                        nn.ELU(),
+                                        nn.Linear(256,128),
+                                        nn.ELU(),
+                                        nn.Linear(128,classes))
+                                        
+        
     def forward(self,input_ids,input_masks,valid_num,labels=None):  #input维度 batchsize,num_sentence,sent_len , label维度batchsize,num_sentence,sent_len
         batch_size,sentence_num,sentence_len = input_ids.size(0),input_ids.size(1),input_ids.size(2)
         hidden_size_bert = self.bert.config.hidden_size
         input_ids,input_masks = input_ids.view(-1,sentence_len),input_masks.view(-1,sentence_len)
         out = self.bert(input_ids,input_masks)      #out维度 batchsize*num_sentence,sen_len,hidden_size
         out = out[0][:,0,:]     #out维度 batchsize*num_sentence,hidden_size
-        out = out.view(batch_size,sentence_num,hidden_size_bert)    #out维度转化为batchsize,num_sentence,hidden_size
+        #out = out.view(batch_size,sentence_num,hidden_size_bert)    #out维度转化为batchsize,num_sentence,hidden_size
+        out = out.view(batch_size,sentence_num,hidden_size_bert).float()
         self.rnn.flatten_parameters()
         outputs,_ = self.rnn(out)   #outputs维度 batchsize,num_sentence,hidden_size
         outputs = self.outlayer(outputs)    #outputs维度为 batchsize,num_sentence,classes
@@ -155,26 +188,28 @@ def train(model,optimizer):
     t0 = time.time()
     avg_loss, avg_acc = [],[]   
     model.train()
-    for step, batch in enumerate(train_dataloader):
-        # 每隔40个batch 输出一下所用时间.
-        if step % 40 == 0 and not step == 0:            
-            elapsed = format_time(time.time() - t0)             
-            print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.'.format(step, len(train_dataloader), elapsed))
-            print(np.array(avg_loss).mean())
-        input_id,input_mask,label,valid_num_tensor = batch[0].long().to(device),batch[1].long().to(device),batch[2].long().to(device),batch[3]
-        valid_num = valid_num_tensor.tolist()
-        output = model(input_id,input_mask,valid_num,label)
-        loss,outputs = output[0],output[1]
-        avg_loss.append(loss.item())
-       
-        acc = binary_acc(outputs, label,classes=8)
-        avg_acc.append(acc)
+    for epoch in range(epochs):
+        for step, batch in enumerate(train_dataloader):
+            # 每隔40个batch 输出一下所用时间.
+            if step % 40 == 0 and not step == 0:            
+                elapsed = format_time(time.time() - t0)             
+                print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.'.format(step+epoch*len(train_dataloader), len(train_dataloader)*epochs, elapsed))
+                print(np.array(avg_loss).mean())
+                avg_loss, avg_acc = [],[]
+            input_id,input_mask,label,valid_num_tensor = batch[0].long().to(device),batch[1].long().to(device),batch[2].long().to(device),batch[3]
+            valid_num = valid_num_tensor.tolist()
+            output = model(input_id,input_mask,valid_num,label)
+            loss,outputs = output[0],output[1]
+            avg_loss.append(loss.item())
         
-        optimizer.zero_grad()
-        loss.backward()
-        clip_grad_norm_(model.parameters(), 1.0)      #大于1的梯度将其设为1.0, 以防梯度爆炸
-        optimizer.step()              #更新模型参数
-        scheduler.step()              #更新learning rate
+            acc = binary_acc(outputs, label,classes=8)
+            avg_acc.append(acc)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 1.0)      #大于1的梯度将其设为1.0, 以防梯度爆炸
+            optimizer.step()              #更新模型参数
+            scheduler.step()              #更新learning rate
     avg_acc = np.array(avg_acc).mean()
     avg_loss = np.array(avg_loss).mean()
     return avg_loss, avg_acc
@@ -212,10 +247,17 @@ def main():
     model = HAN('bert-base-uncased',256,1,8,0.1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = AdamW(model.parameters(), lr = 2e-5, eps = 1e-8)
+    lr = 4e-5
+    optimizer_grouped_parameters = [
+    {'params': [p for n, p in model.named_parameters() if 'bert' in n],'lr':lr},
+    {'params': [p for n, p in model.named_parameters() if 'bert' not in n], 'lr' : 30*lr}]
+    optimizer = AdamW(optimizer_grouped_parameters,lr=lr, eps=1e-8)
+    #optimizer = AdamW(model.parameters(), lr = 2e-5, eps = 1e-8)
     epochs = 2
+    # training steps 的数量: [number of batches] x [number of epochs]. 
     total_steps = len(train_dataloader) * epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = total_steps)
+    # 设计 learning rate scheduler.
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0.1*total_steps, num_training_steps = total_steps)
     train(model,optimizer)
     test_acc = evaluate(model)
 
